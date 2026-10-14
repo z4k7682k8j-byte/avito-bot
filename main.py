@@ -7,6 +7,9 @@ from collections import deque
 from contextlib import asynccontextmanager
 from typing import Dict, Any, List, Optional, Tuple
 from threading import Lock
+from urllib.parse import urlparse
+
+from avito_oauth import AvitoOAuthManager, install_oauth_routes
 
 import requests
 from dotenv import load_dotenv
@@ -22,6 +25,12 @@ AVITO_CLIENT_SECRET = os.getenv("AVITO_CLIENT_SECRET", "").strip()
 AVITO_USER_ID = os.getenv("AVITO_USER_ID", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://avito-bot-x7mf.onrender.com").strip().rstrip("/")
+AVITO_REDIRECT_URI = PUBLIC_BASE_URL + "/oauth/callback"
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
+AVITO_TOKEN_FILE = os.getenv("AVITO_TOKEN_FILE", ".avito-state/oauth.json").strip()
+AVITO_SCOPES = os.getenv("AVITO_SCOPES", "user:read,messenger:read,messenger:write").strip()
 
 # Настройки поведения
 DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() in ("true", "1", "yes")
@@ -62,6 +71,14 @@ def validate_environment() -> None:
     if not WEBHOOK_SECRET:
         errors.append("WEBHOOK_SECRET не задан")
 
+    if len(ADMIN_PASSWORD) < 24:
+        errors.append("ADMIN_PASSWORD должен содержать минимум 24 символа")
+    public = urlparse(PUBLIC_BASE_URL)
+    if public.scheme != "https" or not public.netloc or public.path not in ("", "/") or public.query or public.fragment or public.username:
+        errors.append("PUBLIC_BASE_URL должен быть HTTPS-адресом сервиса без пути")
+    if not AVITO_TOKEN_FILE:
+        errors.append("AVITO_TOKEN_FILE не задан")
+
     if errors:
         for err in errors:
             logger.critical(f"Ошибка конфигурации: {err}")
@@ -74,6 +91,11 @@ class MessageDeduplicator:
         self.ttl = ttl_seconds
         self.cache: Dict[str, float] = {}
         self.lock = Lock()
+
+    def contains(self, message_id: str) -> bool:
+        with self.lock:
+            ts = self.cache.get(message_id)
+            return ts is not None and time.time() - ts <= self.ttl
 
     def is_duplicate(self, message_id: str) -> bool:
         with self.lock:
@@ -90,6 +112,9 @@ class MessageDeduplicator:
 
 
 deduplicator = MessageDeduplicator(ttl_seconds=DEDUPLICATION_CACHE_TTL_SECONDS)
+outgoing_messages = MessageDeduplicator(ttl_seconds=DEDUPLICATION_CACHE_TTL_SECONDS)
+# Serialize one chat so an outgoing webhook cannot race the send response.
+chat_processing_locks = [Lock() for _ in range(64)]
 
 
 # --- Потокобезопасный трекер активности продавца и лимитов бота ---
@@ -139,44 +164,11 @@ dry_run_structure_logged = False
 structure_log_lock = Lock()
 
 
-# --- Управление токеном Avito API (с кэшированием и блокировкой) ---
-class AvitoTokenManager:
-    def __init__(self, client_id: str, client_secret: str):
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self.cached_token: Optional[str] = None
-        self.expires_at: float = 0.0
-        self.lock = Lock()
-
-    def get_token(self, force_refresh: bool = False) -> str:
-        with self.lock:
-            now = time.time()
-            # Буфер 60 секунд до истечения срока действия
-            if not force_refresh and self.cached_token and now < (self.expires_at - 60):
-                return self.cached_token
-
-            logger.info("Запрос нового OAuth токена Авито...")
-            url = "https://api.avito.ru/token"
-            data = {
-                "grant_type": "client_credentials",
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
-            }
-            try:
-                resp = requests.post(url, data=data, timeout=10)
-                resp.raise_for_status()
-                payload = resp.json()
-                self.cached_token = payload["access_token"]
-                expires_in = int(payload.get("expires_in", 3600))
-                self.expires_at = now + expires_in
-                logger.info("OAuth токен Авито успешно получен и закэширован")
-                return self.cached_token
-            except Exception as e:
-                logger.error(f"Не удалось получить OAuth токен Авито: {e}")
-                raise
-
-
-token_manager = AvitoTokenManager(AVITO_CLIENT_ID, AVITO_CLIENT_SECRET)
+# --- OAuth: подтверждение в браузере и обновление токенов ---
+token_manager = AvitoOAuthManager(
+    AVITO_CLIENT_ID, AVITO_CLIENT_SECRET, AVITO_USER_ID,
+    AVITO_REDIRECT_URI, AVITO_TOKEN_FILE,
+)
 
 
 # --- Системный промпт ИИ ---
@@ -261,7 +253,6 @@ def get_avito_chat_history(chat_id: str, limit: int = 10) -> Optional[List[Dict[
 
             if resp.status_code == 401 and retry_on_401:
                 logger.warning("Получен 401 при чтении истории чата. Обновление токена...")
-                token_manager.get_token(force_refresh=True)
                 continue
 
             if resp.status_code == 200:
@@ -303,10 +294,16 @@ def send_avito_message(chat_id: str, text: str) -> bool:
 
             if resp.status_code == 401 and retry_on_401:
                 logger.warning("Получен 401 при отправке сообщения. Обновление токена...")
-                token_manager.get_token(force_refresh=True)
                 continue
 
             if resp.status_code in (200, 201):
+                try:
+                    sent = resp.json()
+                    sent_id = str(sent.get("id") or "") if isinstance(sent, dict) else ""
+                    if sent_id:
+                        outgoing_messages.is_duplicate(sent_id)
+                except ValueError:
+                    logger.warning("Авито подтвердил отправку без JSON с ID. Эхо может включить паузу продавца.")
                 logger.info(f"Сообщение успешно отправлено в чат {chat_id} (длина={len(text)})")
                 return True
             else:
@@ -359,6 +356,27 @@ def build_conversation_context(chat_id: str, fallback_text: str) -> List[Dict[st
 
 # --- Фоновая обработка события вебхука ---
 def process_webhook_event(event: Dict[str, Any]) -> None:
+    if not isinstance(event, dict):
+        return
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return
+    value = payload.get("value")
+    if not isinstance(value, dict):
+        return
+    chat_id = str(value.get("chat_id") or "")
+    if not chat_id or not value.get("author_id"):
+        logger.info("Пропуск события без чата или автора.")
+        return
+    recipient = value.get("user_id")
+    if recipient is not None and str(recipient) != AVITO_USER_ID:
+        logger.warning("Событие другого аккаунта проигнорировано.")
+        return
+    with chat_processing_locks[hash(chat_id) % len(chat_processing_locks)]:
+        _process_webhook_event(event)
+
+
+def _process_webhook_event(event: Dict[str, Any]) -> None:
     global dry_run_structure_logged
 
     try:
@@ -390,6 +408,9 @@ def process_webhook_event(event: Dict[str, Any]) -> None:
 
         # 2. Фильтр: игнорируем собственные сообщения
         if author_id == str(AVITO_USER_ID):
+            if message_id and outgoing_messages.contains(message_id):
+                logger.info("Пропуск эха собственного ответа бота.")
+                return
             logger.info(f"Собственное сообщение (автор={author_id}) в чате {chat_id}. Фиксация активности продавца.")
             chat_limiter.record_seller_message(chat_id)
             return
@@ -410,10 +431,10 @@ def process_webhook_event(event: Dict[str, Any]) -> None:
         incoming_text = ""
         if isinstance(content, dict):
             incoming_text = content.get("text", "")
-        elif isinstance(value.get("text"), str):
+        if not incoming_text and isinstance(value.get("text"), str):
             incoming_text = value.get("text", "")
 
-        incoming_text = incoming_text.strip()
+        incoming_text = incoming_text.strip() if isinstance(incoming_text, str) else ""
         if not incoming_text or not chat_id:
             logger.info(f"Пустой текст сообщения или отсутствует chat_id в чате {chat_id}. Пропуск.")
             return
@@ -436,6 +457,13 @@ def process_webhook_event(event: Dict[str, Any]) -> None:
             logger.warning(
                 f"Достигнут лимит {MAX_BOT_REPLIES_PER_CHAT_PER_HOUR} ответов бота в час для чата {chat_id}. Бот молчит."
             )
+            return
+
+        # Stop before paying for generation when Avito authorization is unavailable.
+        try:
+            token_manager.get_token()
+        except Exception as exc:
+            logger.warning("Обработка остановлена: %s", exc)
             return
 
         # 7. Формирование контекста диалога
@@ -468,11 +496,14 @@ async def lifespan(app: FastAPI):
     validate_environment()
     logger.info("Запуск приложения. Конфигурация успешно проверена.")
     logger.info(f"Режим DRY_RUN={DRY_RUN}, Модель Groq={GROQ_MODEL}")
+    logger.info("Подключение аккаунта: %s/connect", PUBLIC_BASE_URL)
+    logger.warning("Токены должны храниться на постоянном диске для сохранения подключения после перезапуска Render.")
     yield
     logger.info("Остановка приложения.")
 
 
 app = FastAPI(title="Avito AI Autoresponder", lifespan=lifespan)
+install_oauth_routes(app, token_manager, ADMIN_PASSWORD, PUBLIC_BASE_URL, DRY_RUN, AVITO_SCOPES)
 
 
 @app.get("/health")
